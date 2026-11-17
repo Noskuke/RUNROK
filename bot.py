@@ -32,9 +32,11 @@ FULL_QUEUE_PAUSE_MIN = 2 * 60
 FULL_QUEUE_PAUSE_MAX = 5 * 60
 NO_RALLY_PAUSE_MIN = 2 * 60
 NO_RALLY_PAUSE_MAX = 3 * 60
-MAX_WAR_LIST_SCROLLS = 8
+MAX_WAR_LIST_SCROLLS = 6
 MAX_RALLIES_PER_SCAN = 5
-MAX_RALLY_DISTANCE_KM = 40
+MAX_RALLY_DISTANCE_KM = 45
+RALLY_SCROLL_SETTLE_MIN = 1.5
+RALLY_SCROLL_SETTLE_MAX = 2.0
 AP_LOW_THRESHOLD = 0.25
 AP_FULL_THRESHOLD = 0.98
 AP_AVATAR_CLICK_RATIO = (0.02355, 0.04149)
@@ -67,7 +69,36 @@ REQUIRED_TEMPLATES = [
     "ap_use.png",
     "ap_modal_close.png",
     "ap_profile_close.png",
+    "troop_type_infantry.png",
+    "troop_type_archer.png",
+    "troop_type_cavalry.png",
+    "troop_slots.png",
 ]
+
+TROOP_TYPE_TEMPLATES = {
+    "infantry": "troop_type_infantry.png",
+    "archer": "troop_type_archer.png",
+    "cavalry": "troop_type_cavalry.png",
+}
+TROOP_TYPE_SLOTS = {
+    "cavalry": (1, 2),
+    "infantry": (3, 4),
+    "archer": (5,),
+}
+TROOP_TYPE_LABELS = {
+    "cavalry": "kỵ",
+    "infantry": "bộ",
+    "archer": "cung",
+}
+TROOP_SLOT_X_RATIO = 16 / 41
+TROOP_SLOT_Y_RATIOS = (
+    14 / 228,
+    54 / 228,
+    90 / 228,
+    130 / 228,
+    166 / 228,
+    206 / 228,
+)
 
 scale_cache = {}
 gui_root = None
@@ -190,11 +221,20 @@ def focus_window(hwnd):
   """Đưa cửa sổ cần quét lên lớp trên cùng để chụp ảnh và click chính xác."""
   try:
     if win32gui.GetForegroundWindow() != hwnd:
+      win32gui.SetWindowPos(
+          hwnd,
+          win32con.HWND_TOP,
+          0,
+          0,
+          0,
+          0,
+          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+      )
       ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
       ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
       win32gui.SetForegroundWindow(hwnd)
       smart_sleep(0.35)
-    return True
+    return win32gui.GetForegroundWindow() == hwnd
   except Exception:
     return False
 
@@ -488,6 +528,113 @@ def find_joinable_rally(sct, hwnd):
   return None, None
 
 
+def find_rally_troop_type(sct, hwnd, rally_y):
+  _, screen_bgr = grab_window(sct, hwnd)
+  if screen_bgr is None:
+    return None
+
+  matches = []
+  for troop_type, template_path in TROOP_TYPE_TEMPLATES.items():
+    _, panel_positions, panel_size = find_template_positions(
+        sct, hwnd, template_path, threshold=0.80
+    )
+    if not panel_positions or panel_size is None:
+      continue
+
+    for panel_pos in sorted(
+        panel_positions, key=lambda pos: abs(pos[1] - rally_y)
+    ):
+      distance = abs(panel_pos[1] - rally_y)
+      if distance > panel_size[1]:
+        break
+
+      panel_x = panel_pos[0] - panel_size[0] // 2
+      panel_y = panel_pos[1] - panel_size[1] // 2
+      panel = screen_bgr[
+          panel_y : panel_y + panel_size[1],
+          panel_x : panel_x + panel_size[0],
+      ]
+      if panel.shape[:2] != (panel_size[1], panel_size[0]):
+        continue
+
+      detected_type = classify_troop_type_icon(panel)
+      if detected_type == troop_type:
+        matches.append((distance, troop_type, panel_size[1]))
+        break
+
+  if not matches:
+    return None
+
+  matches.sort(key=lambda match: match[0])
+  if (
+      len(matches) > 1
+      and abs(matches[0][0] - matches[1][0]) <= max(2, matches[0][2] * 0.1)
+  ):
+    return None
+
+  return matches[0][1]
+
+
+def classify_troop_type_icon(panel):
+  hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)
+  red_mask = cv2.inRange(
+      hsv, np.array([0, 100, 60]), np.array([10, 255, 255])
+  ) | cv2.inRange(
+      hsv, np.array([170, 100, 60]), np.array([179, 255, 255])
+  )
+
+  h, w = red_mask.shape
+  half_w, half_h = w // 2, h // 2
+  icon_regions = (
+      (0, 0, half_w, half_h),
+      (half_w, 0, w, half_h),
+      (0, half_h, half_w, h),
+      (half_w, half_h, w, h),
+  )
+  red_counts = [
+      np.count_nonzero(red_mask[y1:y2, x1:x2])
+      for x1, y1, x2, y2 in icon_regions
+  ]
+
+  selected_icon = int(np.argmax(red_counts))
+  if red_counts[selected_icon] < max(4, int(h * w * 0.035)):
+    return None
+
+  return {
+      0: "infantry",
+      1: "cavalry",
+      2: "archer",
+  }.get(selected_icon)
+
+
+def select_troop_slots(sct, hwnd, slot_numbers):
+  if any(
+      not 1 <= slot_number <= len(TROOP_SLOT_Y_RATIOS)
+      for slot_number in slot_numbers
+  ):
+    raise ValueError(f"Invalid troop slot numbers: {slot_numbers}")
+
+  win, panel_pos, panel_size = find_template(
+      sct, hwnd, "troop_slots.png", threshold=0.65
+  )
+  if win is None or panel_pos is None or panel_size is None:
+    return False
+
+  panel_x = panel_pos[0] - panel_size[0] // 2
+  panel_y = panel_pos[1] - panel_size[1] // 2
+  slot_positions = [
+      (
+          panel_x + int(panel_size[0] * TROOP_SLOT_X_RATIO),
+          panel_y + int(panel_size[1] * TROOP_SLOT_Y_RATIOS[slot_number - 1]),
+      )
+      for slot_number in slot_numbers
+  ]
+  for slot_pos in slot_positions:
+    click_window_position(win, slot_pos)
+
+  return True
+
+
 def read_ap_fill_ratio(sct, hwnd, is_modal=False):
   template_path = "ap_modal_close.png" if is_modal else "ap_status_label.png"
   roi_ratio = AP_MODAL_CLOSE_ROI if is_modal else None
@@ -669,7 +816,9 @@ def scroll_war_list(hwnd):
   y = win["top"] + int(win["height"] * 0.40)
   pyautogui.moveTo(x, y, duration=random.uniform(0.08, 0.14))
   pyautogui.scroll(-1)
-  smart_sleep(random.uniform(0.8, 1.2))
+  smart_sleep(
+      random.uniform(RALLY_SCROLL_SETTLE_MIN, RALLY_SCROLL_SETTLE_MAX)
+  )
   return True
 
 
@@ -878,6 +1027,8 @@ def bot_worker():
           continue
 
         if not focus_window(hwnd):
+          log(f"[Bậc {idx}] Không thể đưa cửa sổ game lên trước; bỏ qua lượt.")
+          schedule_next_scan(hwnd, 3)
           continue
 
         wait_sec = random.uniform(SCAN_MIN, SCAN_MAX)
@@ -1019,6 +1170,21 @@ def bot_worker():
               scroll_count += 1
               continue
 
+            troop_type = find_rally_troop_type(sct, hwnd, join_pos[1])
+            if troop_type not in TROOP_TYPE_SLOTS:
+              log(
+                  f"[Bậc {idx}] Không nhận diện được loại quân rally; "
+                  "bỏ qua để tránh chọn sai đội hình."
+              )
+              rejected_join_pos = join_pos
+              skip_after_rejected_rally = True
+              continue
+
+            troop_slots = TROOP_TYPE_SLOTS[troop_type]
+            log(
+                f"[Bậc {idx}] Rally {TROOP_TYPE_LABELS[troop_type]}; "
+                f"chọn ô quân {', '.join(map(str, troop_slots))}."
+            )
             click_window_position(join_win, join_pos)
             log(f"[Bậc {idx}] Có rally có thể tham gia! Bấm New Troop...")
             smart_sleep(random.uniform(0.7, 1.0))
@@ -1030,6 +1196,14 @@ def bot_worker():
               break
 
             smart_sleep(random.uniform(0.6, 0.9))
+            if not select_troop_slots(sct, hwnd, troop_slots):
+              log(
+                  f"[Bậc {idx}] Không nhận diện được danh sách ô quân; "
+                  "hủy lượt để tránh gửi sai đội hình."
+              )
+              ensure_world_map(sct, hwnd)
+              break
+
             if not find_and_click(sct, hwnd, "btn_march.png", threshold=0.78):
               log(
                   f"[Bậc {idx}] Không thấy MARCH (có thể hết AP hoặc hàng"
